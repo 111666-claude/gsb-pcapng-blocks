@@ -4,6 +4,7 @@ package pcapng
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 )
 
 // Counter 记录比较次数。
@@ -27,50 +28,60 @@ type File struct {
 	Options   map[int][]byte
 }
 
-func readU16(b []byte) int {
-	return int(b[0]) | int(b[1])<<8
-}
-
-func readU32(b []byte) uint32 {
-	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
-}
+const shbType = 0x0a0d0d0a
 
 // Parse 解析整份文件。
 func Parse(data []byte, c *Counter) (*File, error) {
 	file := &File{Options: map[int][]byte{}}
+	var order binary.ByteOrder = binary.LittleEndian
 	pos := 0
 	for pos+12 <= len(data) {
 		c.Scanned++
-		blockType := readU32(data[pos:])
-		total := int(readU32(data[pos+4:]))
+		blockType := order.Uint32(data[pos:])
+		if blockType == shbType {
+			// SHB 块体开头的字节序魔数决定整份文件的字节序。
+			switch magic := binary.LittleEndian.Uint32(data[pos+8:]); magic {
+			case 0x1a2b3c4d:
+				order = binary.LittleEndian
+				file.BigEndian = false
+			case 0x4d3c2b1a:
+				order = binary.BigEndian
+				file.BigEndian = true
+			}
+		}
+		total := int(order.Uint32(data[pos+4:]))
 		if total < 12 || pos+total > len(data) {
 			break
 		}
+		if order.Uint32(data[pos+total-4:]) != uint32(total) {
+			return nil, errors.New("bad-length")
+		}
 		body := data[pos+8 : pos+total-4]
-		if blockType == 0x0a0d0d0a {
-			if len(body) >= 4 {
-				magic := readU32(body)
-				file.BigEndian = magic == 0x1a2b3c4d
+		switch blockType {
+		case shbType:
+			if len(body) >= 16 {
+				parseOptions(file, order, body[16:], c)
 			}
-			parseOptions(file, body[16:], c)
-		} else if blockType == 1 {
+		case 1:
 			if len(body) >= 8 {
-				file.LinkType = readU16(body)
-				file.Snaplen = int(readU32(body[4:]))
+				file.LinkType = int(order.Uint16(body))
+				file.Snaplen = int(order.Uint32(body[4:]))
+				parseOptions(file, order, body[8:], c)
 			}
-			parseOptions(file, body[8:], c)
-		} else if blockType == 6 {
+		case 6:
 			if len(body) >= 20 {
-				caplen := int(readU32(body[12:]))
+				caplen := int(order.Uint32(body[12:]))
 				start := 20
 				if start+caplen <= len(body) {
 					file.Packets = append(file.Packets, Packet{
-						Iface: int(readU32(body)),
-						TS:    int64(readU32(body[4:]))<<32 | int64(readU32(body[8:])),
+						Iface: int(order.Uint32(body)),
+						TS:    int64(order.Uint32(body[4:]))<<32 | int64(order.Uint32(body[8:])),
 						Data:  append([]byte(nil), body[start:start+caplen]...),
 					})
+					if opts := start + (caplen+3)&^3; opts <= len(body) {
+						parseOptions(file, order, body[opts:], c)
+					}
 				}
-				parseOptions(file, body[start+caplen:], c)
 			}
 		}
 		pos += total
@@ -78,45 +89,62 @@ func Parse(data []byte, c *Counter) (*File, error) {
 	return file, nil
 }
 
-func parseOptions(file *File, data []byte, c *Counter) {
+func parseOptions(file *File, order binary.ByteOrder, data []byte, c *Counter) {
 	i := 0
 	for i+4 <= len(data) {
 		c.Scanned++
-		code := readU16(data[i:])
-		length := readU16(data[i+2:])
+		code := int(order.Uint16(data[i:]))
+		length := int(order.Uint16(data[i+2:]))
 		i += 4
+		if code == 0 {
+			return
+		}
 		if i+length > len(data) {
-			break
+			return
 		}
 		file.Options[code] = append([]byte(nil), data[i:i+length]...)
-		i += length
+		i += (length + 3) &^ 3
 	}
 }
 
+var blockIndex = struct {
+	sync.Mutex
+	data    []byte
+	offsets []int
+}{}
+
 // BlockAt 取第 i 个块。
 func BlockAt(data []byte, i int, c *Counter) ([]byte, error) {
-	pos := 0
-	for n := 0; n < i; n++ {
+	if i < 0 {
+		return nil, errors.New("out-of-range")
+	}
+	blockIndex.Lock()
+	defer blockIndex.Unlock()
+	if len(blockIndex.data) != len(data) || (len(data) > 0 && &blockIndex.data[0] != &data[0]) {
+		blockIndex.data = data
+		blockIndex.offsets = []int{0}
+	}
+	for len(blockIndex.offsets) <= i {
+		pos := blockIndex.offsets[len(blockIndex.offsets)-1]
 		if pos+12 > len(data) {
 			return nil, errors.New("out-of-range")
 		}
 		for k := 0; k < 4; k++ {
 			c.Scanned++
 		}
-		total := int(readU32(data[pos+4:]))
-		if total < 12 {
+		total := int(binary.LittleEndian.Uint32(data[pos+4:]))
+		if total < 12 || pos+total > len(data) {
 			return nil, errors.New("bad-length")
 		}
-		pos += total
+		blockIndex.offsets = append(blockIndex.offsets, pos+total)
 	}
+	pos := blockIndex.offsets[i]
 	if pos+12 > len(data) {
 		return nil, errors.New("out-of-range")
 	}
-	total := int(readU32(data[pos+4:]))
+	total := int(binary.LittleEndian.Uint32(data[pos+4:]))
 	if pos+total > len(data) {
 		return nil, errors.New("out-of-range")
 	}
 	return data[pos : pos+total], nil
 }
-
-var _ = binary.LittleEndian
